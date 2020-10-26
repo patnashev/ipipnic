@@ -1,0 +1,847 @@
+#include "precomp.h"
+
+#pragma alloc_text(PAGE, Transport_Register)
+#pragma alloc_text(PAGE, Transport_Deregister)
+#pragma alloc_text(PAGE, Transport_BootThread)
+#pragma alloc_text(PAGE, Transport_WorkerThread)
+
+LISTROOT Transports;
+
+// WSK Client Dispatch table that denotes the WSK version
+// that the WSK application wants to use and optionally a pointer
+// to the WskClientEvent callback function
+const WSK_CLIENT_DISPATCH WskAppDispatch = {
+  MAKE_WSK_VERSION(1,0), // Use WSK version 1.0
+  0,    // Reserved
+  NULL  // WskClientEvent callback not required for WSK version 1.0
+};
+
+// WSK Registration object
+WSK_REGISTRATION WskRegistration;
+
+NTSTATUS Transport_Register()
+{
+	NTSTATUS Status;
+	WSK_CLIENT_NPI wskClientNpi;
+
+	DBG_INIT("Transport_Register()\n");
+
+	ListActivate(MiniportDriverHandle, &Transports, 0);
+
+	// Register the WSK application
+	wskClientNpi.ClientContext = NULL;
+	wskClientNpi.Dispatch = &WskAppDispatch;
+	Status = WskRegister(&wskClientNpi, &WskRegistration);
+
+	return Status;
+}
+
+VOID Transport_Deregister()
+{
+	while (TRUE)
+	{
+		Transport_Scavenge();
+		if (ListCount(&Transports) > 0)
+		{
+			LARGE_INTEGER Timeout;
+			Timeout.HighPart = -1;
+			Timeout.LowPart = -1000000;
+			KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
+		}
+		else
+			break;
+	}
+
+	WskDeregister(&WskRegistration);
+
+	DBG_INIT("Transport_Deregister()\n");
+}
+
+VOID Transport_BindingLock(BOOLEAN bWrite, PLOCK_STATE LockState)
+{
+	ListLock(&Transports, bWrite, LockState);
+}
+
+VOID Transport_BindingUnlock(PLOCK_STATE LockState)
+{
+	ListUnlock(&Transports, LockState);
+}
+
+PTRANSPORT Transport_Bind(PVOID pVNIC, ULONG BindIP, USHORT BindPort)
+{
+	PLISTNODE Node;
+	LOCK_STATE LockState;
+	PTRANSPORT pTransport = NULL;
+	NDIS_HANDLE NdisIoWorkItemHandle;
+
+	ListLock(&Transports, FALSE, &LockState);
+	for (Node = Transports.First; Node && (((PTRANSPORT)Node->Item)->IP != BindIP || ((PTRANSPORT)Node->Item)->Port != BindPort); Node = Node->Next);
+	if (Node)
+	{
+		pTransport = (PTRANSPORT)Node->Item;
+		ListAdd(&pTransport->VNICList, pVNIC);
+	}
+	ListUnlock(&Transports, &LockState);
+
+	while (pTransport == NULL)
+	{
+		pTransport = ALLOCMEM(sizeof(TRANSPORT));
+		if (pTransport == NULL)
+        {
+			DBG_FAIL(STATUS_INSUFFICIENT_RESOURCES);
+            break;
+        }
+
+		RtlZeroMemory(pTransport, sizeof(TRANSPORT));
+		pTransport->IP = BindIP;
+		pTransport->Port = BindPort;
+
+		KeInitializeEvent(&pTransport->evWrite, SynchronizationEvent, FALSE);
+		KeInitializeEvent(&pTransport->evClose, SynchronizationEvent, FALSE);
+		pTransport->bClosed = FALSE;
+
+		NdisIoWorkItemHandle = NdisAllocateIoWorkItem(MiniportDriverHandle);
+		if (NdisIoWorkItemHandle == NULL)
+        {
+			DBG_FAIL(STATUS_INSUFFICIENT_RESOURCES);
+			FREEMEM(pTransport);
+			pTransport = NULL;
+            break;
+        }
+		NdisQueueIoWorkItem(NdisIoWorkItemHandle, Transport_BootThread, pTransport);
+
+/*		pTransport->SendOffset = 0;
+		pTransport->SendCount = 0;
+		KeInitializeSpinLock(&pTransport->SendLock);
+*/
+		ListActivate(MiniportDriverHandle, &pTransport->SendPool, 0);
+		ListActivate(MiniportDriverHandle, &pTransport->SendQueue, 0);
+
+		ListActivate(MiniportDriverHandle, &pTransport->ReceivePool, 0);
+
+		ListActivate(MiniportDriverHandle, &pTransport->VNICList, 0);
+		ListAdd(&pTransport->VNICList, pVNIC);
+		ListAdd(&Transports, pTransport);
+
+		DBG_INIT("Transport created\n");
+	}
+
+	return pTransport;
+}
+
+VOID Transport_Unbind(PVOID pVNIC, PTRANSPORT pTransport)
+{
+	ListExtract(&pTransport->VNICList, pVNIC);
+}
+
+VOID Transport_Scavenge()
+{
+	PLISTNODE Node;
+	LOCK_STATE LockState;
+	PTRANSPORT pTransport;
+	PSENDITEM pSendItem;
+	LARGE_INTEGER Timeout;
+	Timeout.HighPart = 0;
+	Timeout.LowPart = 0;
+
+	ListLock(&Transports, TRUE, &LockState);
+	do
+	{
+		pTransport = NULL;
+
+		for (Node = Transports.First; Node; Node = Node->Next)
+		{
+			pTransport = (PTRANSPORT)Node->Item;
+			if (ListCount(&pTransport->VNICList) == 0)
+			{
+				if (!pTransport->bClosed && pTransport->pWorkerThread != NULL)
+				{
+					pTransport->bClosed = TRUE;
+					KeSetEvent(&pTransport->evClose, IO_NO_INCREMENT, FALSE);
+				}
+				if (pTransport->bClosed && (pTransport->pWorkerThread == NULL || KeWaitForSingleObject(pTransport->pWorkerThread, Executive, KernelMode, FALSE, &Timeout) == STATUS_SUCCESS))
+					break;
+			}
+			pTransport = NULL;
+		}
+
+		if (pTransport != NULL)
+		{
+//			DBG_INIT("%d sends queued, %d receives pending\n", pTransport->SendCount, pTransport->StatsReceivesPending);
+			DBG_INIT("%d/%d sends, %d receives pending\n", pTransport->SendQueue.Count, pTransport->StatsSendsPending, pTransport->StatsReceivesPending);
+			ListExtract(&Transports, pTransport);
+			if (pTransport->pWorkerThread != NULL)
+			{
+				ObDereferenceObject(pTransport->pWorkerThread);
+				pTransport->pWorkerThread = NULL;
+			}
+			while (pTransport->SendPool.Count)
+			{
+				pSendItem = ListRemove(&pTransport->SendPool, LIST_QUEUE);
+				IoFreeIrp(pSendItem->Irp);
+				FREEMEM(pSendItem);
+			}
+			ListDeactivate(&pTransport->ReceivePool, TRUE);
+			FREEMEM(pTransport);
+
+			DBG_INIT("Transport destroyed\n");
+		}
+
+	} while (pTransport != NULL);
+	ListUnlock(&Transports, &LockState);
+}
+
+VOID Transport_BootThread(PVOID WorkItemContext, NDIS_HANDLE NdisIoWorkItemHandle)
+{
+	NTSTATUS Status;
+	HANDLE ThreadHandle;
+	PTRANSPORT pTransport = (PTRANSPORT)WorkItemContext;
+
+	Status = PsCreateSystemThread(&ThreadHandle, 0, NULL, NULL, NULL, Transport_WorkerThread, pTransport);
+	if (!NT_SUCCESS(Status))
+	{
+		DBG_FAIL(Status);
+	}
+	else
+	{
+        Status = ObReferenceObjectByHandle(ThreadHandle, 0, NULL, KernelMode, &pTransport->pWorkerThread, NULL);
+		if (!NT_SUCCESS(Status))
+		{
+			DBG_FAIL(Status);
+		}
+
+		ZwClose(ThreadHandle);
+	}
+
+	if (pTransport->pWorkerThread == NULL)
+	{
+		pTransport->bClosed = TRUE;
+	}
+
+	NdisFreeIoWorkItem(NdisIoWorkItemHandle);
+}
+
+NTSTATUS EventComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
+{
+	UNREFERENCED_PARAMETER(DeviceObject);
+
+	KeSetEvent(Context, IO_NO_INCREMENT, FALSE);
+
+	return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+/*VOID AdvanceSendQueue(PTRANSPORT pTransport)
+{
+	KIRQL Irql;
+	KeAcquireSpinLock(&pTransport->SendLock, &Irql);
+	pTransport->SendOffset = (pTransport->SendOffset + 1)%MAX_SEND_QUEUE;
+	pTransport->SendCount--;
+	KeReleaseSpinLock(&pTransport->SendLock, Irql);
+}*/
+
+NTSTATUS NBLSendComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
+{
+	PSENDITEM pSendItem = Context;
+	PTRANSPORT pTransport = pSendItem->pTransport;
+
+	if (Irp->IoStatus.Status != STATUS_SUCCESS)
+		InterlockedIncrement(&((PVNIC)pSendItem->pVNIC)->StatsSendsFailed);
+	else
+		InterlockedIncrement64(&((PVNIC)pSendItem->pVNIC)->StatsSendsCompleted);
+	InterlockedDecrement(&((PVNIC)pSendItem->pVNIC)->StatsSendsQueued);
+
+	if (pSendItem->AdvanceDelta > 0)
+		NdisRetreatNetBufferDataStart(pSendItem->CurrentNetBuffer, pSendItem->AdvanceDelta, 0, NULL);
+	if (pSendItem->AdvanceDelta < 0)
+		NdisAdvanceNetBufferDataStart(pSendItem->CurrentNetBuffer, -pSendItem->AdvanceDelta, TRUE, FreeMdl);
+	pSendItem->CurrentNetBuffer = NET_BUFFER_NEXT_NB(pSendItem->CurrentNetBuffer);
+
+	if (pSendItem->CurrentNetBuffer != NULL)
+	{
+		pSendItem->WskBuf.Mdl = NET_BUFFER_CURRENT_MDL(pSendItem->CurrentNetBuffer);
+		pSendItem->WskBuf.Offset = NET_BUFFER_CURRENT_MDL_OFFSET(pSendItem->CurrentNetBuffer);
+		pSendItem->WskBuf.Length = NET_BUFFER_DATA_LENGTH(pSendItem->CurrentNetBuffer);
+
+		IoReuseIrp(pSendItem->Irp, STATUS_SUCCESS);
+		IoSetCompletionRoutine(pSendItem->Irp, NBLSendComplete, pSendItem, TRUE, TRUE, TRUE);
+		((PWSK_PROVIDER_DATAGRAM_DISPATCH)pTransport->Socket->Dispatch)->WskSendTo(pTransport->Socket, &pSendItem->WskBuf, 0, (PSOCKADDR)&pSendItem->Destination, 0, NULL, pSendItem->Irp);
+	}
+	else
+	{
+		NET_BUFFER_LIST_STATUS(pSendItem->NBL) = Irp->IoStatus.Status;
+		NdisMSendNetBufferListsComplete(((PVNIC)pSendItem->pVNIC)->MiniportAdapterHandle, pSendItem->NBL, 0);
+		ListAdd(&pTransport->SendPool, pSendItem);
+		InterlockedDecrement(&pTransport->StatsSendsPending);
+	}
+
+	return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+NTSTATUS ForwardComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
+{
+	PSENDITEM pSendItem = Context;
+	PTRANSPORT pTransport = pSendItem->pTransport;
+
+	if (Irp->IoStatus.Status == STATUS_SUCCESS)
+		DBG_PACKET("Packet forwarded\n");
+	
+	Transport_ReceiveComplete(pSendItem->pReceiveItem);
+
+	ListAdd(&pTransport->SendPool, pSendItem);
+	InterlockedDecrement(&pTransport->StatsSendsPending);
+
+	return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+VOID Transport_WorkerThread(PVOID StartContext)
+{
+	NTSTATUS Status;
+	PTRANSPORT pTransport = (PTRANSPORT)StartContext;
+    PKEVENT pEvents[2];
+	LARGE_INTEGER Timeout;
+	WSK_PROVIDER_NPI wskProviderNpi;
+	PIRP Irp;
+	KEVENT evComplete;
+	SOCKADDR_IN Endpoint;
+	PSENDITEM pSendItem;
+	WSK_BUF WskBuf;
+	WSK_CLIENT_DATAGRAM_DISPATCH ClientDispatch;
+	WSK_EVENT_CALLBACK_CONTROL EventCallbackControl;
+
+	Status = WskCaptureProviderNPI(&WskRegistration, WSK_INFINITE_WAIT, &wskProviderNpi);
+	if (Status != STATUS_SUCCESS)
+	{
+		DBG_FAIL(Status);
+		return;
+	}
+
+	Irp = IoAllocateIrp(1, FALSE);
+	if (!Irp)
+	{
+		DBG_FAIL(STATUS_INSUFFICIENT_RESOURCES);
+		WskReleaseProviderNPI(&WskRegistration);
+		return;
+	}
+
+	ClientDispatch.WskReceiveFromEvent = Transport_ReceiveFromEvent;
+
+	KeInitializeEvent(&evComplete, SynchronizationEvent, FALSE);
+	IoSetCompletionRoutine(Irp, EventComplete, &evComplete, TRUE, TRUE, TRUE);
+	if (pTransport->Port == 0xFFFF)
+	{
+		DBG_INIT("Creating IP socket...\n");
+		wskProviderNpi.Dispatch->WskSocket(wskProviderNpi.Client, AF_INET, SOCK_RAW, IPPROTO_IPV4, WSK_FLAG_DATAGRAM_SOCKET, pTransport, &ClientDispatch, NULL, NULL, NULL, Irp);
+		Endpoint.sin_family = AF_INET;
+		Endpoint.sin_port = 0;
+		Endpoint.sin_addr.S_un.S_addr = pTransport->IP;
+	}
+	else
+	{
+		DBG_INIT("Creating UDP socket...\n");
+		wskProviderNpi.Dispatch->WskSocket(wskProviderNpi.Client, AF_INET, SOCK_DGRAM, IPPROTO_UDP, WSK_FLAG_DATAGRAM_SOCKET, pTransport, &ClientDispatch, NULL, NULL, NULL, Irp);
+		Endpoint.sin_family = AF_INET;
+		Endpoint.sin_port = pTransport->Port;
+		Endpoint.sin_addr.S_un.S_addr = pTransport->IP;
+	}
+
+	KeWaitForSingleObject(&evComplete, Executive, KernelMode, FALSE, NULL);
+	Status = Irp->IoStatus.Status;
+	if (Status != STATUS_SUCCESS)
+	{
+		DBG_FAIL(Status);
+		IoFreeIrp(Irp);
+		WskReleaseProviderNPI(&WskRegistration);
+		return;
+	}
+
+	pTransport->Socket = (PWSK_SOCKET)Irp->IoStatus.Information;
+	DBG_INIT("Socket created\n");
+
+	IoReuseIrp(Irp, STATUS_SUCCESS);
+	IoSetCompletionRoutine(Irp, EventComplete, &evComplete, TRUE, TRUE, TRUE);
+	((PWSK_PROVIDER_LISTEN_DISPATCH)pTransport->Socket->Dispatch)->WskBind(pTransport->Socket, (PSOCKADDR)&Endpoint, 0, Irp);
+
+	KeWaitForSingleObject(&evComplete, Executive, KernelMode, FALSE, NULL);
+	Status = Irp->IoStatus.Status;
+	if (Status != STATUS_SUCCESS)
+	{
+		DBG_WARNING("Socket bind fails = %x.\n", Status);
+		pTransport->bClosed = TRUE;
+	}
+
+	EventCallbackControl.NpiId = &NPI_WSK_INTERFACE_ID;
+	EventCallbackControl.EventMask = WSK_EVENT_RECEIVE_FROM;
+	Status = ((PWSK_PROVIDER_CONNECTION_DISPATCH)pTransport->Socket->Dispatch)->WskControlSocket(pTransport->Socket, WskSetOption, SO_WSK_EVENT_CALLBACK, SOL_SOCKET, sizeof(WSK_EVENT_CALLBACK_CONTROL), &EventCallbackControl, 0, NULL, NULL, NULL);
+	if (Status != STATUS_SUCCESS)
+	{
+		DBG_WARNING("Socket event control fails = %x.\n", Status);
+		pTransport->bClosed = TRUE;
+	}
+
+	pEvents[0] = &pTransport->evWrite;
+	pEvents[1] = &pTransport->evClose;
+
+	while (!pTransport->bClosed)
+	{
+		Status = KeWaitForMultipleObjects(2, (PVOID)pEvents, WaitAny, Executive, KernelMode, FALSE, NULL, NULL);
+
+		if (Status == STATUS_WAIT_0)
+		{
+/*			while (!pTransport->bClosed && pTransport->SendCount > 0)
+			{
+				pSendItem = pTransport->SendQueue + pTransport->SendOffset;
+
+				if (pSendItem->NBL != NULL)
+				{
+					WskBuf.Mdl = NET_BUFFER_CURRENT_MDL(pSendItem->CurrentNetBuffer);
+					WskBuf.Offset = NET_BUFFER_CURRENT_MDL_OFFSET(pSendItem->CurrentNetBuffer);
+					WskBuf.Length = NET_BUFFER_DATA_LENGTH(pSendItem->CurrentNetBuffer);
+
+					IoReuseIrp(Irp, STATUS_SUCCESS);
+					IoSetCompletionRoutine(Irp, EventComplete, &evComplete, TRUE, TRUE, TRUE);
+					((PWSK_PROVIDER_DATAGRAM_DISPATCH)pTransport->Socket->Dispatch)->WskSendTo(pTransport->Socket, &WskBuf, 0, (PSOCKADDR)&pSendItem->Destination, 0, NULL, Irp);
+
+					KeWaitForSingleObject(&evComplete, Executive, KernelMode, FALSE, NULL);
+					Status = Irp->IoStatus.Status;
+
+					if (Status != STATUS_SUCCESS)
+						InterlockedIncrement(&((PVNIC)pSendItem->pVNIC)->StatsSendsFailed);
+					else
+						InterlockedIncrement64(&((PVNIC)pSendItem->pVNIC)->StatsSendsCompleted);
+					InterlockedDecrement(&((PVNIC)pSendItem->pVNIC)->StatsSendsQueued);
+
+					if (pSendItem->AdvanceDelta > 0)
+						NdisRetreatNetBufferDataStart(pSendItem->CurrentNetBuffer, pSendItem->AdvanceDelta, 0, NULL);
+					if (pSendItem->AdvanceDelta < 0)
+						NdisAdvanceNetBufferDataStart(pSendItem->CurrentNetBuffer, -pSendItem->AdvanceDelta, TRUE, FreeMdl);
+					pSendItem->CurrentNetBuffer = NET_BUFFER_NEXT_NB(pSendItem->CurrentNetBuffer);
+
+					if (pSendItem->CurrentNetBuffer == NULL)
+					{
+						NET_BUFFER_LIST_STATUS(pSendItem->NBL) = Status;
+						NdisMSendNetBufferListsComplete(((PVNIC)pSendItem->pVNIC)->MiniportAdapterHandle, pSendItem->NBL, 0);
+						AdvanceSendQueue(pTransport);
+					}
+				}
+				else if (pSendItem->pReceiveItem != NULL)
+				{
+					IoReuseIrp(Irp, STATUS_SUCCESS);
+					IoSetCompletionRoutine(Irp, EventComplete, &evComplete, TRUE, TRUE, TRUE);
+					((PWSK_PROVIDER_DATAGRAM_DISPATCH)pTransport->Socket->Dispatch)->WskSendTo(pTransport->Socket, &pSendItem->WskBuf, 0, (PSOCKADDR)&pSendItem->Destination, 0, NULL, Irp);
+
+					KeWaitForSingleObject(&evComplete, Executive, KernelMode, FALSE, NULL);
+					Status = Irp->IoStatus.Status;
+					if (Status == STATUS_SUCCESS)
+						DBG_PACKET("Packet forwarded\n");
+
+					Transport_ReceiveComplete(pSendItem->pReceiveItem);
+					AdvanceSendQueue(pTransport);
+				}
+			}*/
+			while (!pTransport->bClosed && ListCount(&pTransport->SendQueue) > 0)
+			{
+				pSendItem = ListRemove(&pTransport->SendQueue, LIST_QUEUE);
+
+				if (pSendItem->NBL != NULL)
+				{
+					pSendItem->WskBuf.Mdl = NET_BUFFER_CURRENT_MDL(pSendItem->CurrentNetBuffer);
+					pSendItem->WskBuf.Offset = NET_BUFFER_CURRENT_MDL_OFFSET(pSendItem->CurrentNetBuffer);
+					pSendItem->WskBuf.Length = NET_BUFFER_DATA_LENGTH(pSendItem->CurrentNetBuffer);
+
+					IoReuseIrp(pSendItem->Irp, STATUS_SUCCESS);
+					IoSetCompletionRoutine(pSendItem->Irp, NBLSendComplete, pSendItem, TRUE, TRUE, TRUE);
+					((PWSK_PROVIDER_DATAGRAM_DISPATCH)pTransport->Socket->Dispatch)->WskSendTo(pTransport->Socket, &pSendItem->WskBuf, 0, (PSOCKADDR)&pSendItem->Destination, 0, NULL, pSendItem->Irp);
+					
+					InterlockedIncrement(&pTransport->StatsSendsPending);
+				}
+				else if (pSendItem->pReceiveItem != NULL)
+				{
+					IoReuseIrp(pSendItem->Irp, STATUS_SUCCESS);
+					IoSetCompletionRoutine(pSendItem->Irp, ForwardComplete, pSendItem, TRUE, TRUE, TRUE);
+					((PWSK_PROVIDER_DATAGRAM_DISPATCH)pTransport->Socket->Dispatch)->WskSendTo(pTransport->Socket, &pSendItem->WskBuf, 0, (PSOCKADDR)&pSendItem->Destination, 0, NULL, pSendItem->Irp);
+
+					InterlockedIncrement(&pTransport->StatsSendsPending);
+				}
+			}
+		}
+	}
+
+/*	while (pTransport->SendCount > 0)
+	{
+		pSendItem = pTransport->SendQueue + pTransport->SendOffset;
+
+		if (pSendItem->NBL != NULL)
+		{
+			DBG_WARNING("Receive pending on exit\n");
+			NET_BUFFER_LIST_STATUS(pSendItem->NBL) = NDIS_STATUS_RESET_IN_PROGRESS;
+			NdisMSendNetBufferListsComplete(((PVNIC)pSendItem->pVNIC)->MiniportAdapterHandle, pSendItem->NBL, 0);
+		}
+		else if (pSendItem->pReceiveItem != NULL)
+		{
+			Transport_ReceiveComplete(pSendItem->pReceiveItem);
+		}
+		AdvanceSendQueue(pTransport);
+	}*/
+
+	while (ListCount(&pTransport->SendQueue) > 0)
+	{
+		pSendItem = ListRemove(&pTransport->SendQueue, LIST_QUEUE);
+
+		if (pSendItem->NBL != NULL)
+		{
+			DBG_WARNING("Receive pending on exit\n");
+			NET_BUFFER_LIST_STATUS(pSendItem->NBL) = NDIS_STATUS_RESET_IN_PROGRESS;
+			NdisMSendNetBufferListsComplete(((PVNIC)pSendItem->pVNIC)->MiniportAdapterHandle, pSendItem->NBL, 0);
+		}
+		else if (pSendItem->pReceiveItem != NULL)
+		{
+			Transport_ReceiveComplete(pSendItem->pReceiveItem);
+		}
+
+		ListAdd(&pTransport->SendPool, pSendItem);
+	}
+
+	Timeout.HighPart = -1;
+	Timeout.LowPart = -500000;
+	while (pTransport->StatsSendsPending > 0)
+		KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
+
+	IoReuseIrp(Irp, STATUS_SUCCESS);
+	IoSetCompletionRoutine(Irp, EventComplete, &evComplete, TRUE, TRUE, TRUE);
+	((PWSK_PROVIDER_BASIC_DISPATCH)pTransport->Socket->Dispatch)->WskCloseSocket(pTransport->Socket, Irp);
+
+	KeWaitForSingleObject(&evComplete, Executive, KernelMode, FALSE, NULL);
+	Status = Irp->IoStatus.Status;
+	if (Status != STATUS_SUCCESS)
+	{
+		DBG_FAIL(Status);
+	}
+
+	IoFreeIrp(Irp);
+	WskReleaseProviderNPI(&WskRegistration);
+
+	DBG_INIT("Transport_WorkerThread exit\n");
+}
+
+NTSTATUS Transport_Send(PVOID pVNIC, PTRANSPORT pTransport, PNET_BUFFER_LIST NBL, LONG AdvanceDelta, ULONG IP, USHORT Port)
+{
+	NTSTATUS Status = STATUS_INSUFFICIENT_RESOURCES;
+	KIRQL Irql;
+	PSENDITEM pSendItem;
+
+/*	KeAcquireSpinLock(&pTransport->SendLock, &Irql);
+	if (pTransport->SendCount < MAX_SEND_QUEUE)
+	{
+		pSendItem = pTransport->SendQueue + (pTransport->SendOffset + pTransport->SendCount)%MAX_SEND_QUEUE;*/
+	pSendItem = ListRemove(&pTransport->SendPool, LIST_QUEUE);
+	if (pSendItem == NULL)
+	{
+		pSendItem = ALLOCMEM(sizeof(SENDITEM));
+		if (pSendItem != NULL)
+		{
+			pSendItem->Irp = IoAllocateIrp(1, FALSE);
+			if (pSendItem->Irp == NULL)
+			{
+				FREEMEM(pSendItem);
+				pSendItem = NULL;
+			}
+		}
+	}
+	if (pSendItem != NULL)
+	{
+		pSendItem->pTransport = pTransport;
+		pSendItem->pVNIC = pVNIC;
+		pSendItem->NBL = NBL;
+		pSendItem->CurrentNetBuffer = NET_BUFFER_LIST_FIRST_NB(NBL);
+		pSendItem->Destination.sin_family = AF_INET;
+		pSendItem->Destination.sin_port = Port;
+		pSendItem->Destination.sin_addr.S_un.S_addr = IP;
+		pSendItem->AdvanceDelta = AdvanceDelta;
+		pSendItem->pReceiveItem = NULL;
+
+//		pTransport->SendCount++;
+		ListAdd(&pTransport->SendQueue, pSendItem);
+		KeSetEvent(&pTransport->evWrite, IO_NO_INCREMENT, FALSE);
+		Status = STATUS_SUCCESS;
+	}
+//	KeReleaseSpinLock(&pTransport->SendLock, Irql);
+
+	return Status;
+}
+
+NTSTATUS WSKAPI Transport_ReceiveFromEvent(PVOID SocketContext, ULONG Flags, PWSK_DATAGRAM_INDICATION DataIndication)
+{
+	PLISTNODE Node;
+	LOCK_STATE LockState;
+	PTRANSPORT pTransport = (PTRANSPORT)SocketContext;
+	PRECEIVEITEM pReceiveItem;
+	PVNIC pVNIC;
+	PWSK_DATAGRAM_INDICATION cur;
+	ULONG Offset;
+	//ULONG Length;
+	//UCHAR Buffer[32 + ETH_HEADER_SIZE];
+	UCHAR Buffer[20];
+	PUCHAR pIPHeader;
+	ULONG src;
+	ULONG dst;
+	PNET_BUFFER_LIST NBL;
+	PNET_BUFFER NB;
+	PRECEIVE_CONTEXT pReceiveContext;
+	KIRQL Irql;
+	NTSTATUS Status = STATUS_PENDING;
+	PLISTNODE HostNode;
+	PVIRTUALHOST pVirtualHost;
+	PSENDITEM pSendItem;
+
+	DBG_PACKET("Receive event\n");
+
+	pReceiveItem = ListRemove(&pTransport->ReceivePool, LIST_QUEUE);
+	if (pReceiveItem == NULL)
+	{
+		pReceiveItem = ALLOCMEM(sizeof(RECEIVEITEM));
+		KeInitializeSpinLock(&pReceiveItem->RefLock);
+	}
+
+	pReceiveItem->pTransport = pTransport;
+	pReceiveItem->DataIndication = DataIndication;
+	pReceiveItem->RefCount = 1;
+
+	cur = DataIndication;
+	while (cur != NULL)
+	{
+		if (pTransport->Port == 0xFFFF && ((PSOCKADDR_IN)cur->RemoteAddress)->sin_addr.S_un.S_addr == 0x00007502)
+		{
+			cur = cur->Next;
+			DBG_PACKET("Packet already processed\n");
+			continue;
+		}
+		if (cur->RemoteAddress != NULL)
+			DBG_PACKET("%d.%d.%d.%d\n", ((PSOCKADDR_IN)cur->RemoteAddress)->sin_addr.S_un.S_un_b.s_b1, ((PSOCKADDR_IN)cur->RemoteAddress)->sin_addr.S_un.S_un_b.s_b2, ((PSOCKADDR_IN)cur->RemoteAddress)->sin_addr.S_un.S_un_b.s_b3, ((PSOCKADDR_IN)cur->RemoteAddress)->sin_addr.S_un.S_un_b.s_b4);
+		Offset = cur->Buffer.Offset;
+		if (pTransport->Port == 0xFFFF)
+			Offset += (GetByte(cur->Buffer.Mdl, Offset) & 0x0F) << 2;
+
+/*		Length = (GetByte(cur->Buffer.Mdl, Offset) & 0x0F) << 2;
+		if (Length > 32)
+			Length = 32;
+		if (Length < 20 || cur->Buffer.Offset + cur->Buffer.Length < Offset + Length || Offset < ETH_HEADER_SIZE)*/
+		if (cur->Buffer.Offset + cur->Buffer.Length < Offset + 20 || Offset < ETH_HEADER_SIZE)
+		{
+			DBG_WARNING("Invalid packet, offset = %d\n", Offset);
+		}
+		else
+		{
+			//pIPHeader = GetData(cur->Buffer.Mdl, Offset, Length, Buffer + ETH_HEADER_SIZE);
+			pIPHeader = GetData(cur->Buffer.Mdl, Offset, 20, Buffer);
+			if (pIPHeader != NULL && pIPHeader[8] != 0)
+			{
+				src = *(ULONG *)&pIPHeader[12];
+				dst = *(ULONG *)&pIPHeader[16];
+
+				Transport_BindingLock(FALSE, &LockState);
+				for (Node = pTransport->VNICList.First; Node && !TestAddress((PVNIC)Node->Item, dst); Node = Node->Next);
+				if (Node)
+				{
+					pVNIC = (PVNIC)Node->Item;
+
+					if (pIPHeader[9] == 0x04)
+						Offset += 20;
+
+					ETH_COPY_NETWORK_ADDRESS(Buffer, pVNIC->CurrentAddress);
+					ETH_COPY_NETWORK_ADDRESS(Buffer + 6, pVNIC->CurrentAddress);
+					Buffer[11]++;
+					Buffer[12] = 0x08;
+					Buffer[13] = 0x00;
+/*					if (Length == 32 && *(ULONG *)&pIPHeader[20] == 0x04080CAA)
+					{
+						if (pIPHeader != Buffer + ETH_HEADER_SIZE)
+						{
+							*(ULONG *)&Buffer[ETH_HEADER_SIZE + 0] = *(ULONG *)&pIPHeader[0];
+							*(ULONG *)&Buffer[ETH_HEADER_SIZE + 4] = *(ULONG *)&pIPHeader[4];
+							*(ULONG *)&Buffer[ETH_HEADER_SIZE + 8] = *(ULONG *)&pIPHeader[8];
+						}
+						Buffer[ETH_HEADER_SIZE + 0] -= 3;
+						if (Buffer[ETH_HEADER_SIZE + 3] < 12)
+							Buffer[ETH_HEADER_SIZE + 2]--;
+						Buffer[ETH_HEADER_SIZE + 3] -= 12;
+						*(ULONG *)&Buffer[ETH_HEADER_SIZE + 12] = *(ULONG *)&pIPHeader[24];
+						*(ULONG *)&Buffer[ETH_HEADER_SIZE + 16] = *(ULONG *)&pIPHeader[28];
+
+						Offset -= 2;
+						SetData(cur->Buffer.Mdl, Offset, Buffer, 34);
+					}
+					else*/
+					{
+						Offset -= 14;
+						SetData(cur->Buffer.Mdl, Offset, Buffer, 14);
+					}
+
+					NBL = AllocNBL(pVNIC);
+					NB = NET_BUFFER_LIST_FIRST_NB(NBL);
+
+					NET_BUFFER_FIRST_MDL(NB) = cur->Buffer.Mdl;
+					NET_BUFFER_DATA_LENGTH(NB) = cur->Buffer.Offset + (ULONG)cur->Buffer.Length - Offset;
+					NET_BUFFER_DATA_OFFSET(NB) = Offset;
+					NET_BUFFER_CURRENT_MDL(NB) = cur->Buffer.Mdl;
+					while (MmGetMdlByteCount(NET_BUFFER_CURRENT_MDL(NB)) < Offset)
+					{
+						Offset -= MmGetMdlByteCount(NET_BUFFER_CURRENT_MDL(NB));
+						NET_BUFFER_CURRENT_MDL(NB) = NDIS_MDL_LINKAGE(NET_BUFFER_CURRENT_MDL(NB));
+					}
+					NET_BUFFER_CURRENT_MDL_OFFSET(NB) = Offset;
+
+					pReceiveContext = (PRECEIVE_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(NBL);
+					pReceiveContext->pReceiveItem = pReceiveItem;
+					InterlockedIncrement(&pReceiveItem->RefCount);
+
+					NdisMIndicateReceiveNetBufferLists(pVNIC->MiniportAdapterHandle, NBL, 0, 1, NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL);
+				}
+				else
+				{
+					pVirtualHost = NULL;
+					for (Node = pTransport->VNICList.First; Node; Node = Node->Next)
+					{
+						pVNIC = (PVNIC)Node->Item;
+						for (HostNode = pVNIC->HostsList.First; HostNode && ((PVIRTUALHOST)HostNode->Item)->IP != (dst & ((PVIRTUALHOST)HostNode->Item)->Mask); HostNode = HostNode->Next);
+						if (HostNode != NULL)
+						{
+							pVirtualHost = HostNode->Item;
+							for (HostNode = pVNIC->HostsList.First; HostNode && ((PVIRTUALHOST)HostNode->Item)->IP != (pVirtualHost->RemoteIP & ((PVIRTUALHOST)HostNode->Item)->Mask); HostNode = HostNode->Next);
+							if (HostNode != NULL)
+							{
+								pVirtualHost = HostNode->Item;
+							}
+							break;
+						}
+					}
+
+					if (pVirtualHost != NULL && pVirtualHost->pTransport != NULL)
+					{
+						if (pIPHeader != Buffer)
+						{
+							*(ULONG *)&Buffer[8] = *(ULONG *)&pIPHeader[8];
+							*(ULONG *)&Buffer[12] = *(ULONG *)&pIPHeader[12];
+						}
+						Buffer[8]--;
+						(*(USHORT *)&Buffer[10])++;
+						if (Buffer[9] == 0x04)
+							*(ULONG *)&Buffer[12] = pVNIC->PrimaryIP;
+						SetData(cur->Buffer.Mdl, Offset + 8, Buffer + 8, 8);
+/*
+						KeAcquireSpinLock(&pVirtualHost->pTransport->SendLock, &Irql);
+						if (pVirtualHost->pTransport->SendCount < MAX_SEND_QUEUE)
+						{
+							pSendItem = pVirtualHost->pTransport->SendQueue + (pVirtualHost->pTransport->SendOffset + pVirtualHost->pTransport->SendCount)%MAX_SEND_QUEUE;
+							pSendItem->pVNIC = pVNIC;
+							pSendItem->NBL = NULL;
+							pSendItem->CurrentNetBuffer = NULL;
+							pSendItem->Destination.sin_family = AF_INET;
+							pSendItem->Destination.sin_port = pVirtualHost->RemotePort;
+							pSendItem->Destination.sin_addr.S_un.S_addr = pVirtualHost->RemoteIP;
+							pSendItem->AdvanceDelta = 0;
+
+							pSendItem->pReceiveItem = pReceiveItem;
+							InterlockedIncrement(&pReceiveItem->RefCount);
+
+							pSendItem->WskBuf.Length = cur->Buffer.Offset + (ULONG)cur->Buffer.Length - Offset;
+							pSendItem->WskBuf.Offset = Offset;
+							pSendItem->WskBuf.Mdl = cur->Buffer.Mdl;
+							while (MmGetMdlByteCount(pSendItem->WskBuf.Mdl) < pSendItem->WskBuf.Offset)
+							{
+								pSendItem->WskBuf.Offset -= MmGetMdlByteCount(pSendItem->WskBuf.Mdl);
+								pSendItem->WskBuf.Mdl = pSendItem->WskBuf.Mdl->Next;
+							}
+
+							pVirtualHost->pTransport->SendCount++;
+							KeSetEvent(&pVirtualHost->pTransport->evWrite, IO_NO_INCREMENT, FALSE);
+
+							DBG_PACKET("Forward packet queued\n");
+						}
+						KeReleaseSpinLock(&pVirtualHost->pTransport->SendLock, Irql);
+*/
+						pSendItem = ListRemove(&pVirtualHost->pTransport->SendPool, LIST_QUEUE);
+						if (pSendItem == NULL)
+						{
+							pSendItem = ALLOCMEM(sizeof(SENDITEM));
+							if (pSendItem != NULL)
+							{
+								pSendItem->Irp = IoAllocateIrp(1, FALSE);
+								if (pSendItem->Irp == NULL)
+								{
+									FREEMEM(pSendItem);
+									pSendItem = NULL;
+								}
+							}
+						}
+						if (pSendItem != NULL)
+						{
+							pSendItem->pTransport = pVirtualHost->pTransport;
+							pSendItem->pVNIC = pVNIC;
+							pSendItem->NBL = NULL;
+							pSendItem->CurrentNetBuffer = NULL;
+							pSendItem->Destination.sin_family = AF_INET;
+							pSendItem->Destination.sin_port = pVirtualHost->RemotePort;
+							pSendItem->Destination.sin_addr.S_un.S_addr = pVirtualHost->RemoteIP;
+							pSendItem->AdvanceDelta = 0;
+
+							pSendItem->pReceiveItem = pReceiveItem;
+							InterlockedIncrement(&pReceiveItem->RefCount);
+
+							pSendItem->WskBuf.Length = cur->Buffer.Offset + (ULONG)cur->Buffer.Length - Offset;
+							pSendItem->WskBuf.Offset = Offset;
+							pSendItem->WskBuf.Mdl = cur->Buffer.Mdl;
+							while (MmGetMdlByteCount(pSendItem->WskBuf.Mdl) < pSendItem->WskBuf.Offset)
+							{
+								pSendItem->WskBuf.Offset -= MmGetMdlByteCount(pSendItem->WskBuf.Mdl);
+								pSendItem->WskBuf.Mdl = pSendItem->WskBuf.Mdl->Next;
+							}
+
+							ListAdd(&pVirtualHost->pTransport->SendQueue, pSendItem);
+							KeSetEvent(&pVirtualHost->pTransport->evWrite, IO_NO_INCREMENT, FALSE);
+
+							DBG_PACKET("Forward packet queued\n");
+						}
+
+						if (pTransport->Port == 0xFFFF)
+						{
+							*(ULONG *)&Buffer[0] = 0x00007502;
+							SetData(cur->Buffer.Mdl, Offset - 8, Buffer, 4);
+						}
+					}
+				}
+				Transport_BindingUnlock(&LockState);
+			}
+		}
+
+		cur = cur->Next;
+	}
+
+	KeAcquireSpinLock(&pReceiveItem->RefLock, &Irql);
+	InterlockedDecrement(&pReceiveItem->RefCount);
+	if (pReceiveItem->RefCount == 0)
+	{
+		ListAdd(&pTransport->ReceivePool, pReceiveItem);
+		Status = STATUS_SUCCESS;
+	}
+	KeReleaseSpinLock(&pReceiveItem->RefLock, Irql);
+
+	if (Status == STATUS_PENDING)
+		InterlockedIncrement(&pTransport->StatsReceivesPending);
+
+	return Status;
+}
+
+VOID Transport_ReceiveComplete(PRECEIVEITEM pReceiveItem)
+{
+	KIRQL Irql;
+
+	KeAcquireSpinLock(&pReceiveItem->RefLock, &Irql);
+	InterlockedDecrement(&pReceiveItem->RefCount);
+	if (pReceiveItem->RefCount == 0)
+	{
+		((PWSK_PROVIDER_DATAGRAM_DISPATCH)pReceiveItem->pTransport->Socket->Dispatch)->WskRelease(pReceiveItem->pTransport->Socket, pReceiveItem->DataIndication);
+		InterlockedDecrement(&pReceiveItem->pTransport->StatsReceivesPending);
+		ListAdd(&pReceiveItem->pTransport->ReceivePool, pReceiveItem);
+	}
+	KeReleaseSpinLock(&pReceiveItem->RefLock, Irql);
+}

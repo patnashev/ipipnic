@@ -1,0 +1,27 @@
+TARGETNAME=ipipnic
+TARGETTYPE=DRIVER
+
+USER_C_FLAGS=$(USER_C_FLAGS) /GS
+
+C_DEFINES=$(C_DEFINES) -DNDIS_MINIPORT_DRIVER
+C_DEFINES=$(C_DEFINES) -DNDIS_WDM
+C_DEFINES=$(C_DEFINES) -DNDIS60_MINIPORT
+C_DEFINES=$(C_DEFINES) -DNDIS60
+
+PRECOMPILED_INCLUDE=precomp.h
+PRECOMPILED_PCH=precomp.pch
+PRECOMPILED_OBJ=precomp.obj
+
+TARGETLIBS=$(DDK_LIB_PATH)\ndis.lib $(DDK_LIB_PATH)\netio.lib $(SDK_LIB_PATH)\uuid.lib
+
+INCLUDES=$(BASE_INC_PATH)
+
+SOURCES=\
+    adapter.c \
+    list.c \
+    transport.c \
+    ipipnic.c \
+    ipipnic.rc \
+    ipipnic.mof
+
+NTTARGETFILE0=$(OBJ_PATH)\$(O)\mof.h

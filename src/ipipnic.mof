@@ -1,0 +1,24 @@
+[WMI, Dynamic, Provider("WMIProv"),
+ guid("{0216418C-B7B9-4ADB-AC29-EAA33DDCDB9A}"),
+ localeid(0x409),
+ WmiExpense(1),
+ Description("Virtual Hosts List")]
+class IPIPNIC_VirtualHosts
+{
+	[key, read]
+	string	InstanceName;				//	Instance name returned from WMI
+
+	[read]
+	boolean	Active;
+
+	[read,
+     	Description("Number of array elements."),
+		WmiDataId(1)] uint32 NumberElements;
+
+	[read,
+        Description("Binary array composed of 24-byte elements."),
+		WmiDataId(2),
+		WmiSizeIs("NumberElements")]    uint8 VirtualHostsData[];
+
+};
+
